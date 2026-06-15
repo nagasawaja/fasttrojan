@@ -1,0 +1,25 @@
+services:
+  xray:
+    image: ${XRAY_IMAGE:-ghcr.io/xtls/xray-core:latest}
+    container_name: trojan-xray
+    restart: unless-stopped
+    command: run -config /usr/local/etc/xray/config.json
+    ports:
+      - "443:443/tcp"
+    volumes:
+      - ./xray/config.json:/usr/local/etc/xray/config.json:ro
+      - ./certs:/usr/local/etc/xray/certs:ro
+    depends_on:
+      - nginx
+
+  nginx:
+    image: nginx:stable-alpine
+    container_name: trojan-fallback
+    restart: unless-stopped
+    ports:
+      - "80:80/tcp"
+    expose:
+      - "8080"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/html:/usr/share/nginx/html:ro

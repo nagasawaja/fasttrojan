@@ -1,0 +1,304 @@
+# Ephemeral Trojan on Vultr
+
+这个项目用于按需创建 Vultr VPS，通过 Cloudflare 更新域名 A 记录，然后用 Docker Compose 部署 Xray Trojan。用完后可以一条命令销毁 VPS 和 DNS 记录。
+
+## 设计
+
+```text
+local deploy.sh
+  -> Vultr API creates Ubuntu VPS with cloud-init
+  -> cloud-init installs Docker Engine and Compose plugin
+  -> Cloudflare API updates DOMAIN A record, proxied=false
+  -> local certbot issues/reuses a DNS-01 certificate through Cloudflare
+  -> cloud-init unpacks the compose bundle and starts Xray + nginx fallback
+```
+
+本地敏感文件默认不提交：
+
+- `.env`：Vultr / Cloudflare token 和域名配置
+- `.state/`：VPS ID、DNS record ID、Trojan 密码、客户端链接
+- `.certs/`：Let's Encrypt 证书缓存
+
+## 前置条件
+
+本地需要：
+
+- `bash`
+- `curl`
+- `jq`
+- `ssh` / `scp`
+- `openssl`
+- `docker`，仅在需要自动签发证书时使用
+
+Vultr 需要：
+
+- API key
+- 可用的 region / plan
+- SSH key，默认使用 `~/.ssh/id_ed25519`，不存在时会自动生成
+
+Cloudflare 需要：
+
+- Zone ID
+- API Token
+- Token 至少需要该 zone 的 DNS edit 权限
+
+普通 Trojan TCP 不应打开 Cloudflare 橙云代理，脚本默认 `CF_PROXIED=false`。
+
+## 配置
+
+```bash
+cp .env.example .env
+chmod 600 .env
+```
+
+至少填写：
+
+```bash
+VULTR_API_KEY=...
+CLOUDFLARE_API_TOKEN=...
+CLOUDFLARE_ZONE_ID=...
+DOMAIN=t.example.com
+ACME_EMAIL=you@example.com
+```
+
+默认实例配置：
+
+```bash
+VULTR_REGION=nrt
+VULTR_PLAN=vc2-1c-1gb
+VULTR_OS_NAME="Ubuntu 24.04 x64"
+VULTR_OS_QUERY="Ubuntu 24.04"
+```
+
+脚本会先按 `VULTR_OS_NAME` 精确匹配，再按 `VULTR_OS_QUERY` 模糊匹配。如果 Vultr 的 OS 名称匹配失败，可以直接设置：
+
+```bash
+VULTR_OS_ID=2284
+```
+
+实际 OS ID 以 Vultr `/v2/os` API 返回为准。
+
+默认 SSH 配置：
+
+```bash
+VULTR_SSH_KEY_ID=
+VULTR_SSH_PUBLIC_KEY_FILE=~/.ssh/id_ed25519.pub
+SSH_PRIVATE_KEY_FILE=~/.ssh/id_ed25519
+GENERATE_SSH_KEY=true
+SSH_WAIT_INTERVAL=10
+```
+
+如果 `SSH_PRIVATE_KEY_FILE` 不存在，脚本会自动生成一个本地 ed25519 key，并把公钥上传到 Vultr。已有 key 不会被覆盖。
+
+默认部署方式：
+
+```bash
+DEPLOY_METHOD=cloud-init
+REMOTE_DIR=/opt/trojan
+```
+
+`cloud-init` 模式会把 Docker Compose、Xray 配置和证书打包进 Vultr user-data，让服务器首启时自己完成部署，不依赖 SSH/SCP。对应的 `.state/cloud-init-rendered.yml` 和 `.state/trojan-bundle.tar.gz` 包含证书私钥，不要分享或提交。
+
+订阅地址固定为：
+
+```text
+https://<DOMAIN>/shuadhTro.123
+```
+
+路径固定为 `/shuadhTro.123`。
+
+## 部署
+
+```bash
+./deploy.sh
+```
+
+部署完成后会输出：
+
+- 域名
+- VPS IP
+- 订阅 URL
+- state 文件位置
+- Trojan 客户端 URI
+
+客户端 URI 也会写入：
+
+```text
+.state/client-uri.txt
+```
+
+如果 `.state/trojan-state.json` 里已有实例 ID，`deploy.sh` 会复用该实例并检查服务可用性。强制创建新实例：
+
+```bash
+./deploy.sh --force-new
+```
+
+`cloud-init` 模式复用已有实例时不会重放 user-data，因此本地 Docker/nginx/Xray 配置变更需要用 `--force-new` 才会部署到新机器。`--force-new` 默认会在新机器 HTTPS 检查通过、DNS 切换完成后销毁旧实例；如需保留旧实例，设置 `DESTROY_OLD_ON_FORCE_NEW=false`。
+
+如果 macOS 在频繁切换域名 IP 后仍解析到旧地址，可以手动清理本机 DNS 缓存：
+
+```bash
+./scripts/flush-macos-dns.sh
+```
+
+如果 Linux 服务器无法访问 Docker Hub，可以配置 Docker registry mirror：
+
+```bash
+sudo ./scripts/configure-docker-mirror.sh https://your-id.mirror.aliyuncs.com
+docker pull certbot/dns-cloudflare:latest
+```
+
+阿里云 ECS 建议使用阿里云控制台提供的个人镜像加速地址，不要直接照抄别人的 mirror URL。
+
+## 证书
+
+默认情况下，如果没有配置本地证书路径，脚本会用 Docker 运行 `certbot/dns-cloudflare`，通过 Cloudflare DNS-01 签发或复用证书：
+
+```text
+.certs/live/<DOMAIN>/fullchain.pem
+.certs/live/<DOMAIN>/privkey.pem
+```
+
+如果你已经有证书，可以跳过 certbot：
+
+```bash
+CERT_FULLCHAIN_FILE=/path/to/fullchain.pem
+CERT_PRIVATE_KEY_FILE=/path/to/privkey.pem
+```
+
+如果 `.certs/live/<DOMAIN>/fullchain.pem` 已存在且距离过期超过 `CERT_RENEW_BEFORE_SECONDS`，脚本会直接复用本地证书，不会启动 certbot 容器，也不会拉 Docker Hub 镜像。
+
+测试证书签发流程时可以使用 Let's Encrypt staging：
+
+```bash
+ACME_STAGING=true ./deploy.sh
+```
+
+staging 证书不适合真实客户端使用。
+
+## 销毁
+
+交互确认：
+
+```bash
+./destroy.sh
+```
+
+非交互：
+
+```bash
+./destroy.sh --yes
+```
+
+只销毁 VPS，保留 DNS：
+
+```bash
+./destroy.sh --yes --keep-dns
+```
+
+销毁脚本默认根据 `.state/trojan-state.json` 删除对应 Vultr instance 和 Cloudflare DNS record。
+
+## 状态检查
+
+多台电脑共同管理时，可以用状态检查确认本机 state、Cloudflare DNS、系统 DNS 缓存和 Vultr 实例是否一致：
+
+```bash
+./status.sh
+```
+
+如果 `System resolver IP` 和 `Cloudflare A record` 不一致，说明本机或上游 DNS 仍缓存旧记录。macOS 可以运行：
+
+```bash
+./scripts/flush-macos-dns.sh
+```
+
+## Vultr 地区测速
+
+可以直接用项目里的脚本对 Vultr Looking Glass 做本地测速，默认测试东京、大阪、首尔、新加坡：
+
+```bash
+./scripts/test-vultr-regions.sh
+```
+
+只测指定地区：
+
+```bash
+./scripts/test-vultr-regions.sh --regions nrt,sgp,icn
+```
+
+自定义下载测试大小：
+
+```bash
+./scripts/test-vultr-regions.sh --bytes 20971520
+```
+
+脚本会输出每个地区的：
+
+- 平均 `ping` 延迟
+- 丢包率
+- 基于 Vultr `100MB.bin` 的分段下载速度
+- HTTP 返回码
+
+## Clash Verge Rev 合并
+
+不要直接编辑订阅下载下来的 YAML；订阅更新时会覆盖。推荐生成增强脚本，把本项目的 Trojan 节点注入到现有订阅的策略组里：
+
+```bash
+./scripts/export-clash-verge-script.sh
+```
+
+脚本会生成：
+
+```text
+.state/clash-verge-script.js
+```
+
+在 Clash Verge Rev 里把这个文件作为当前订阅的 Script/脚本增强使用。订阅的 rules 和 proxy-groups 仍然来自原订阅；每次订阅更新后，这个本地节点会重新加回策略组。
+
+## 文件结构
+
+```text
+deploy.sh
+destroy.sh
+status.sh
+scripts/lib.sh
+scripts/export-clash-verge-script.sh
+templates/cloud-init.yml
+templates/docker-compose.yml
+templates/nginx-default.conf
+templates/fallback-index.html
+.env.example
+```
+
+远端 VPS 上的默认目录：
+
+```text
+/opt/trojan
+```
+
+包含：
+
+```text
+docker-compose.yml
+xray/config.json
+certs/fullchain.pem
+certs/privkey.pem
+nginx/default.conf
+nginx/html/index.html
+```
+
+## 注意
+
+- 建议给 Vultr 配置 Cloud Firewall，只开放 `443/tcp` 和必要的 `22/tcp`。
+- 如果需要普通 Web 外观，也开放 `80/tcp`；nginx 会把 HTTP 301 跳转到 HTTPS。
+- Cloudflare DNS record 必须是 DNS only，即 `proxied=false`。
+- 订阅地址固定为 `https://<DOMAIN>/shuadhTro.123`，不要公开分享。
+- `.state/trojan-state.json` 包含 Trojan 密码，不要上传或分享。
+- `.certs/` 包含证书私钥，不要上传或分享。
+
+## 参考
+
+- [Vultr cloud-init user-data](https://docs.vultr.com/how-to-deploy-a-vultr-server-with-cloudinit-userdata)
+- [Cloudflare DNS records API](https://developers.cloudflare.com/dns/manage-dns-records/how-to/create-dns-records/)
+- [Xray Docker image layout](https://xtls.github.io/en/document/install.html#docker-installation)
+- [Docker Engine for Ubuntu](https://docs.docker.com/engine/install/ubuntu/)
