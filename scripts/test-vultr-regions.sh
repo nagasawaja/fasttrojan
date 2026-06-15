@@ -142,7 +142,7 @@ normalize_region_code() {
 }
 
 print_header() {
-  printf '%-14s %-16s %-10s %-24s %10s %9s %12s %8s\n' \
+  printf '%-14s %-16s %-10s %-24s %10s %8s %12s %8s\n' \
     'Country' 'Region' 'Code' 'Host' 'Avg(ms)' 'Loss(%)' 'Speed(Mbps)' 'HTTP'
 }
 
@@ -209,7 +209,9 @@ for code in $REGIONS; do
   if name="$(region_name "$code")" && country="$(region_country "$code")" && host="$(region_host "$code")"; then
     (
       ping_result="$(test_ping "$host")"
-      printf '%s\t%s\t%s\t%s\t%s\n' "$country" "$name" "$host" "$code" "$ping_result" > "$tmp_dir/$code"
+      ping_avg="$(printf '%s\n' "$ping_result" | awk '{print $1}')"
+      ping_loss="$(printf '%s\n' "$ping_result" | awk '{print $2}')"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$country" "$name" "$host" "$code" "$ping_avg" "$ping_loss" > "$tmp_dir/$code"
     ) &
   else
     printf 'UNKNOWN\tUNKNOWN\t-\t%s\tERR\tERR\n' "$code" > "$tmp_dir/$code"
@@ -233,6 +235,7 @@ for code in "${codes[@]}"; do
     http_code="$(printf '%s\n' "$download_result" | awk '{print $2}')"
   fi
 
-  printf '%-14s %-16s %-10s %-24s %10s %9s %12s %8s\n' \
-    "$country" "$name" "$code" "$host" "$ping_avg" "$ping_loss" "$speed_mbps" "$http_code"
+  loss_display="${ping_loss}%"
+  printf '%-14s %-16s %-10s %-24s %10s %8s %12s %8s\n' \
+    "$country" "$name" "$code" "$host" "$ping_avg" "$loss_display" "$speed_mbps" "$http_code"
 done
