@@ -51,7 +51,7 @@ local_instance_id="$(state_get instance_id || true)"
 local_ip="$(state_get main_ip || true)"
 local_dns_record_id="$(state_get dns_record_id || true)"
 local_subscription_path="$(state_get subscription_path || true)"
-[ -n "$local_subscription_path" ] || local_subscription_path="/shuadhTro.123"
+[ -n "$local_subscription_path" ] || local_subscription_path="${SUBSCRIPTION_PATH:-/shuadhTrojan.123}"
 
 encoded_domain="$(urlencode "$DOMAIN")"
 cf_response="$(cloudflare_api GET "/zones/$CLOUDFLARE_ZONE_ID/dns_records?type=A&name=$encoded_domain&per_page=100")"

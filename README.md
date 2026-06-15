@@ -95,6 +95,7 @@ SSH_WAIT_INTERVAL=10
 ```bash
 DEPLOY_METHOD=cloud-init
 REMOTE_DIR=/opt/trojan
+SUBSCRIPTION_PATH=/shuadhTrojan.123
 ```
 
 `cloud-init` 模式会把 Docker Compose、Xray 配置和证书打包进 Vultr user-data，让服务器首启时自己完成部署，不依赖 SSH/SCP。对应的 `.state/cloud-init-rendered.yml` 和 `.state/trojan-bundle.tar.gz` 包含证书私钥，不要分享或提交。
@@ -102,10 +103,10 @@ REMOTE_DIR=/opt/trojan
 订阅地址固定为：
 
 ```text
-https://<DOMAIN>/shuadhTro.123
+https://<DOMAIN><SUBSCRIPTION_PATH>
 ```
 
-路径固定为 `/shuadhTro.123`。
+默认路径是 `/shuadhTrojan.123`，可在 `.env` 里通过 `SUBSCRIPTION_PATH` 调整。
 
 ## 部署
 
@@ -292,7 +293,7 @@ nginx/html/index.html
 - 建议给 Vultr 配置 Cloud Firewall，只开放 `443/tcp` 和必要的 `22/tcp`。
 - 如果需要普通 Web 外观，也开放 `80/tcp`；nginx 会把 HTTP 301 跳转到 HTTPS。
 - Cloudflare DNS record 必须是 DNS only，即 `proxied=false`。
-- 订阅地址固定为 `https://<DOMAIN>/shuadhTro.123`，不要公开分享。
+- 订阅地址由 `.env` 里的 `SUBSCRIPTION_PATH` 控制，默认是 `https://<DOMAIN>/shuadhTrojan.123`，不要公开分享。
 - `.state/trojan-state.json` 包含 Trojan 密码，不要上传或分享。
 - `.certs/` 包含证书私钥，不要上传或分享。
 

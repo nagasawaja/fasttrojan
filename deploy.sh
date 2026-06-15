@@ -87,7 +87,7 @@ CERTBOT_IMAGE="${CERTBOT_IMAGE:-certbot/dns-cloudflare:latest}"
 XRAY_IMAGE="${XRAY_IMAGE:-ghcr.io/xtls/xray-core:latest}"
 REMOTE_DIR="${REMOTE_DIR:-/opt/trojan}"
 DEPLOY_METHOD="${DEPLOY_METHOD:-cloud-init}"
-SUBSCRIPTION_PATH="/shuadhTro.123"
+SUBSCRIPTION_PATH="${SUBSCRIPTION_PATH:-/shuadhTrojan.123}"
 DESTROY_OLD_ON_FORCE_NEW="${DESTROY_OLD_ON_FORCE_NEW:-true}"
 CERTBOT_CREDENTIALS_FILE=""
 
@@ -96,6 +96,7 @@ case "$DEPLOY_METHOD" in
   cloud-init|ssh) ;;
   *) die "Unsupported DEPLOY_METHOD: $DEPLOY_METHOD" ;;
 esac
+[ "${SUBSCRIPTION_PATH#/}" != "$SUBSCRIPTION_PATH" ] || die "SUBSCRIPTION_PATH must start with /"
 
 preflight_api_access() {
   log "Checking Vultr API access"
