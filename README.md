@@ -68,6 +68,7 @@ VULTR_REGION=nrt
 VULTR_PLAN=vc2-1c-1gb
 VULTR_OS_NAME="Ubuntu 24.04 x64"
 VULTR_OS_QUERY="Ubuntu 24.04"
+VULTR_ENABLE_IPV6=false
 ```
 
 脚本会先按 `VULTR_OS_NAME` 精确匹配，再按 `VULTR_OS_QUERY` 模糊匹配。如果 Vultr 的 OS 名称匹配失败，可以直接设置：
@@ -89,6 +90,14 @@ SSH_WAIT_INTERVAL=10
 ```
 
 如果 `SSH_PRIVATE_KEY_FILE` 不存在，脚本会自动生成一个本地 ed25519 key，并把公钥上传到 Vultr。已有 key 不会被覆盖。
+
+默认情况下，Vultr instance label 会自动带上创建时间，格式类似：
+
+```text
+trojan-example-com-202606150344
+```
+
+如果你需要固定名称，也可以在 `.env` 里显式设置 `VULTR_LABEL`。
 
 默认部署方式：
 
@@ -215,7 +224,7 @@ staging 证书不适合真实客户端使用。
 
 ## Vultr 地区测速
 
-可以直接用项目里的脚本对 Vultr Looking Glass 做本地测速，默认测试东京、大阪、首尔、新加坡：
+可以直接用项目里的脚本对 Vultr Looking Glass 做本地测速，默认只测 `ping`，覆盖东京、大阪、首尔、新加坡、洛杉矶、纽约、德国、英国、悉尼：
 
 ```bash
 ./scripts/test-vultr-regions.sh
@@ -224,7 +233,13 @@ staging 证书不适合真实客户端使用。
 只测指定地区：
 
 ```bash
-./scripts/test-vultr-regions.sh --regions nrt,sgp,icn
+./scripts/test-vultr-regions.sh --regions nrt,sgp,icn,lax,nyc,fra,uk,syd
+```
+
+连下载测速一起测：
+
+```bash
+./scripts/test-vultr-regions.sh --speed
 ```
 
 自定义下载测试大小：
@@ -235,10 +250,11 @@ staging 证书不适合真实客户端使用。
 
 脚本会输出每个地区的：
 
+- 国家
 - 平均 `ping` 延迟
 - 丢包率
-- 基于 Vultr `100MB.bin` 的分段下载速度
-- HTTP 返回码
+- 可选的基于 Vultr `100MB.bin` 的分段下载速度
+- 可选的 HTTP 返回码
 
 ## Clash Verge Rev 合并
 

@@ -69,7 +69,10 @@ VULTR_REGION="${VULTR_REGION:-nrt}"
 VULTR_PLAN="${VULTR_PLAN:-vc2-1c-1gb}"
 VULTR_OS_NAME="${VULTR_OS_NAME:-Ubuntu 24.04 x64}"
 VULTR_OS_QUERY="${VULTR_OS_QUERY:-Ubuntu 24.04}"
-VULTR_LABEL="${VULTR_LABEL:-trojan-${DOMAIN//./-}}"
+DEFAULT_VULTR_LABEL_TS="$(date '+%Y%m%d%H%M')"
+VULTR_LABEL="${VULTR_LABEL:-trojan-${DOMAIN//./-}-${DEFAULT_VULTR_LABEL_TS}}"
+VULTR_HOSTNAME="$(printf '%s' "$VULTR_LABEL" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-' | cut -c1-63)"
+VULTR_ENABLE_IPV6="${VULTR_ENABLE_IPV6:-false}"
 VULTR_SSH_PUBLIC_KEY_FILE="${VULTR_SSH_PUBLIC_KEY_FILE:-~/.ssh/id_ed25519.pub}"
 SSH_PRIVATE_KEY_FILE="${SSH_PRIVATE_KEY_FILE:-~/.ssh/id_ed25519}"
 GENERATE_SSH_KEY="${GENERATE_SSH_KEY:-true}"
@@ -96,6 +99,7 @@ case "$DEPLOY_METHOD" in
   cloud-init|ssh) ;;
   *) die "Unsupported DEPLOY_METHOD: $DEPLOY_METHOD" ;;
 esac
+[ -n "$VULTR_HOSTNAME" ] || die "Resolved empty Vultr hostname from VULTR_LABEL"
 [ "${SUBSCRIPTION_PATH#/}" != "$SUBSCRIPTION_PATH" ] || die "SUBSCRIPTION_PATH must start with /"
 
 preflight_api_access() {
@@ -201,10 +205,11 @@ create_instance() {
     --arg region "$VULTR_REGION" \
     --arg plan "$VULTR_PLAN" \
     --arg instance_label "$VULTR_LABEL" \
-    --arg hostname "$VULTR_LABEL" \
+    --arg hostname "$VULTR_HOSTNAME" \
     --arg user_data "$cloud_init_b64" \
     --arg ssh_key_id "$ssh_key_id" \
     --arg firewall_group_id "${VULTR_FIREWALL_GROUP_ID:-}" \
+    --argjson enable_ipv6 "$(json_bool "$VULTR_ENABLE_IPV6")" \
     --argjson os_id "$os_id" \
     '{
       "region": $region,
@@ -213,7 +218,7 @@ create_instance() {
       "label": $instance_label,
       "hostname": $hostname,
       "user_data": $user_data,
-      "enable_ipv6": true,
+      "enable_ipv6": $enable_ipv6,
       "activation_email": false,
       "sshkey_id": [$ssh_key_id],
       "tags": ["trojan", "ephemeral"]

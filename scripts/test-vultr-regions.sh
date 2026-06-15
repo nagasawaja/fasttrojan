@@ -4,30 +4,32 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  ./scripts/test-vultr-regions.sh [--regions CODE[,CODE...]] [--ping-count N] [--bytes N]
+  ./scripts/test-vultr-regions.sh [--regions CODE[,CODE...]] [--ping-count N] [--speed] [--bytes N]
 
 Examples:
   ./scripts/test-vultr-regions.sh
-  ./scripts/test-vultr-regions.sh --regions nrt,sgp,icn
-  ./scripts/test-vultr-regions.sh --bytes 10485760
+  ./scripts/test-vultr-regions.sh --regions nrt,sgp,icn,lax,nyc,fra,uk,syd
+  ./scripts/test-vultr-regions.sh --speed --bytes 10485760
 
 Options:
   --regions     Comma-separated Vultr region codes to test.
-                Default: nrt,osa,icn,sgp
+                Default: nrt,osa,icn,sgp,lax,nyc,fra,uk,syd
   --ping-count  Number of ICMP echo requests per region. Default: 4
+  --speed       Also test HTTP download throughput.
   --bytes       Bytes to download for the throughput test via HTTP range request.
                 Default: 10485760 (10 MiB)
   -h, --help    Show this help
 
 The script uses Vultr Looking Glass hosts and tests:
   1. Ping latency and packet loss
-  2. Partial download throughput from vultr.com.100MB.bin
+  2. Optional partial download throughput from vultr.com.100MB.bin
 USAGE
 }
 
-REGIONS="nrt,osa,icn,sgp"
+REGIONS="nrt,osa,icn,sgp,lax,nyc,fra,uk,syd"
 PING_COUNT=4
 DOWNLOAD_BYTES=10485760
+DO_SPEED=false
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -40,6 +42,10 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 2 ] || { usage >&2; exit 1; }
       PING_COUNT="$2"
       shift 2
+      ;;
+    --speed)
+      DO_SPEED=true
+      shift
       ;;
     --bytes)
       [ "$#" -ge 2 ] || { usage >&2; exit 1; }
@@ -87,7 +93,24 @@ region_name() {
     osa) printf 'Osaka' ;;
     icn) printf 'Seoul' ;;
     sgp) printf 'Singapore' ;;
+    lax) printf 'Los Angeles' ;;
+    nyc) printf 'New York' ;;
+    fra) printf 'Frankfurt' ;;
+    uk) printf 'London' ;;
     syd) printf 'Sydney' ;;
+    *) return 1 ;;
+  esac
+}
+
+region_country() {
+  case "$1" in
+    nrt|osa) printf 'Japan' ;;
+    icn) printf 'South Korea' ;;
+    sgp) printf 'Singapore' ;;
+    lax|nyc) printf 'United States' ;;
+    fra) printf 'Germany' ;;
+    uk) printf 'United Kingdom' ;;
+    syd) printf 'Australia' ;;
     *) return 1 ;;
   esac
 }
@@ -98,14 +121,29 @@ region_host() {
     osa) printf 'osk-jp-ping.vultr.com' ;;
     icn) printf 'sel-kor-ping.vultr.com' ;;
     sgp) printf 'sgp-ping.vultr.com' ;;
+    lax) printf 'lax-ca-us-ping.vultr.com' ;;
+    nyc) printf 'nj-us-ping.vultr.com' ;;
+    fra) printf 'fra-de-ping.vultr.com' ;;
+    uk) printf 'lon-gb-ping.vultr.com' ;;
     syd) printf 'syd-au-ping.vultr.com' ;;
     *) return 1 ;;
   esac
 }
 
+normalize_region_code() {
+  case "$1" in
+    losangel|losangeles|lax) printf 'lax' ;;
+    nyc|nj|ewr) printf 'nyc' ;;
+    fra|de|germany) printf 'fra' ;;
+    uk|lhr|london|lon) printf 'uk' ;;
+    nrt|osa|icn|sgp|syd) printf '%s' "$1" ;;
+    *) return 1 ;;
+  esac
+}
+
 print_header() {
-  printf '%-5s %-10s %-24s %10s %9s %12s %8s\n' \
-    'Code' 'Region' 'Host' 'Avg(ms)' 'Loss(%)' 'Speed(Mbps)' 'HTTP'
+  printf '%-14s %-16s %-10s %-24s %10s %9s %12s %8s\n' \
+    'Country' 'Region' 'Code' 'Host' 'Avg(ms)' 'Loss(%)' 'Speed(Mbps)' 'HTTP'
 }
 
 test_ping() {
@@ -117,7 +155,7 @@ test_ping() {
     return
   fi
 
-  loss="$(printf '%s\n' "$output" | awk -F', ' '/packet loss/ {gsub("%", "", $3); print $3}' | head -n 1)"
+  loss="$(printf '%s\n' "$output" | sed -n 's/.* \([0-9.][0-9.]*\)% packet loss.*/\1/p' | head -n 1)"
   avg="$(printf '%s\n' "$output" | awk -F'/' '/min\/avg\/max/ {print $5}' | head -n 1)"
 
   [ -n "$loss" ] || loss="ERR"
@@ -157,23 +195,44 @@ print_header
 
 old_ifs="$IFS"
 IFS=','
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+codes=()
 for code in $REGIONS; do
   code="$(printf '%s' "$code" | tr '[:upper:]' '[:lower:]' | xargs)"
-  if ! name="$(region_name "$code")"; then
-    printf '%-5s %-10s %-24s %10s %9s %12s %8s\n' "$code" 'UNKNOWN' '-' '-' '-' '-' '-'
+  if ! code="$(normalize_region_code "$code")"; then
+    codes+=("$code")
+    printf 'UNKNOWN\tUNKNOWN\t-\t%s\tERR\tERR\n' "$code" > "$tmp_dir/$code"
     continue
   fi
-  host="$(region_host "$code")"
-
-  ping_result="$(test_ping "$host")"
-  ping_avg="$(printf '%s\n' "$ping_result" | awk '{print $1}')"
-  ping_loss="$(printf '%s\n' "$ping_result" | awk '{print $2}')"
-
-  download_result="$(test_download "$host")"
-  speed_mbps="$(printf '%s\n' "$download_result" | awk '{print $1}')"
-  http_code="$(printf '%s\n' "$download_result" | awk '{print $2}')"
-
-  printf '%-5s %-10s %-24s %10s %9s %12s %8s\n' \
-    "$code" "$name" "$host" "$ping_avg" "$ping_loss" "$speed_mbps" "$http_code"
+  codes+=("$code")
+  if name="$(region_name "$code")" && country="$(region_country "$code")" && host="$(region_host "$code")"; then
+    (
+      ping_result="$(test_ping "$host")"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$country" "$name" "$host" "$code" "$ping_result" > "$tmp_dir/$code"
+    ) &
+  else
+    printf 'UNKNOWN\tUNKNOWN\t-\t%s\tERR\tERR\n' "$code" > "$tmp_dir/$code"
+  fi
 done
+wait
 IFS="$old_ifs"
+
+for code in "${codes[@]}"; do
+  if [ ! -f "$tmp_dir/$code" ]; then
+    printf '%-14s %-16s %-10s %-24s %10s %9s %12s %8s\n' 'UNKNOWN' 'UNKNOWN' "$code" '-' '-' '-' '-' '-'
+    continue
+  fi
+
+  IFS=$'\t' read -r country name host code ping_avg ping_loss < "$tmp_dir/$code"
+  speed_mbps='-'
+  http_code='-'
+  if [ "$DO_SPEED" = true ] && [ "$name" != "UNKNOWN" ]; then
+    download_result="$(test_download "$host")"
+    speed_mbps="$(printf '%s\n' "$download_result" | awk '{print $1}')"
+    http_code="$(printf '%s\n' "$download_result" | awk '{print $2}')"
+  fi
+
+  printf '%-14s %-16s %-10s %-24s %10s %9s %12s %8s\n' \
+    "$country" "$name" "$code" "$host" "$ping_avg" "$ping_loss" "$speed_mbps" "$http_code"
+done
