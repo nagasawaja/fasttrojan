@@ -1,6 +1,6 @@
-# Ephemeral Trojan on Vultr
+# Ephemeral Proxy on Vultr
 
-这个项目用于按需创建 Vultr VPS，通过 Cloudflare 更新域名 A 记录，然后用 Docker Compose 部署 Xray Trojan。用完后可以一条命令销毁 VPS 和 DNS 记录。
+这个项目用于按需创建 Vultr VPS，通过 Cloudflare 更新域名 A 记录，然后用 Docker Compose 部署可选的 `Trojan` 或 `AnyTLS` 代理。用完后可以一条命令销毁 VPS 和 DNS 记录。
 
 ## 设计
 
@@ -10,13 +10,13 @@ local deploy.sh
   -> cloud-init installs Docker Engine and Compose plugin
   -> Cloudflare API updates DOMAIN A record, proxied=false
   -> local certbot issues/reuses a DNS-01 certificate through Cloudflare
-  -> cloud-init unpacks the compose bundle and starts Xray + nginx fallback
+  -> cloud-init unpacks the compose bundle and starts the selected proxy stack
 ```
 
 本地敏感文件默认不提交：
 
 - `.env`：Vultr / Cloudflare token 和域名配置
-- `.state/`：VPS ID、DNS record ID、Trojan 密码、客户端链接
+- `.state/`：VPS ID、DNS record ID、代理密码、客户端链接
 - `.certs/`：Let's Encrypt 证书缓存
 
 ## 前置条件
@@ -42,7 +42,7 @@ Cloudflare 需要：
 - API Token
 - Token 至少需要该 zone 的 DNS edit 权限
 
-普通 Trojan TCP 不应打开 Cloudflare 橙云代理，脚本默认 `CF_PROXIED=false`。
+代理流量不应打开 Cloudflare 橙云代理，脚本默认 `CF_PROXIED=false`。
 
 ## 配置
 
@@ -102,12 +102,24 @@ trojan-example-com-202606150344
 默认部署方式：
 
 ```bash
+PROXY_STACK=trojan
 DEPLOY_METHOD=cloud-init
 REMOTE_DIR=/opt/trojan
 SUBSCRIPTION_PATH=/shuadhTrojan.123
 ```
 
-`cloud-init` 模式会把 Docker Compose、Xray 配置和证书打包进 Vultr user-data，让服务器首启时自己完成部署，不依赖 SSH/SCP。对应的 `.state/cloud-init-rendered.yml` 和 `.state/trojan-bundle.tar.gz` 包含证书私钥，不要分享或提交。
+可选协议：
+
+```bash
+# 保持现有 Trojan 流程
+PROXY_STACK=trojan
+
+# 启用 AnyTLS，默认会把协议监听在 8443，443 继续留给 HTTPS 订阅和伪装页
+PROXY_STACK=anytls
+ANYTLS_PORT=8443
+```
+
+`cloud-init` 模式会把 Docker Compose、协议配置和证书打包进 Vultr user-data，让服务器首启时自己完成部署，不依赖 SSH/SCP。对应的 `.state/cloud-init-rendered.yml` 和 `.state/proxy-bundle.tar.gz` 包含证书私钥，不要分享或提交。
 
 订阅地址固定为：
 
@@ -125,11 +137,12 @@ https://<DOMAIN><SUBSCRIPTION_PATH>
 
 部署完成后会输出：
 
+- 当前代理协议
 - 域名
 - VPS IP
 - 订阅 URL
 - state 文件位置
-- Trojan 客户端 URI
+- 客户端 URI
 
 客户端 URI 也会写入：
 
@@ -143,7 +156,7 @@ https://<DOMAIN><SUBSCRIPTION_PATH>
 ./deploy.sh --force-new
 ```
 
-`cloud-init` 模式复用已有实例时不会重放 user-data，因此本地 Docker/nginx/Xray 配置变更需要用 `--force-new` 才会部署到新机器。`--force-new` 默认会在新机器 HTTPS 检查通过、DNS 切换完成后销毁旧实例；如需保留旧实例，设置 `DESTROY_OLD_ON_FORCE_NEW=false`。
+`cloud-init` 模式复用已有实例时不会重放 user-data，因此本地 Docker/nginx/协议配置变更需要用 `--force-new` 才会部署到新机器。`--force-new` 默认会在新机器健康检查通过、DNS 切换完成后销毁旧实例；如需保留旧实例，设置 `DESTROY_OLD_ON_FORCE_NEW=false`。
 
 如果 macOS 在频繁切换域名 IP 后仍解析到旧地址，可以手动清理本机 DNS 缓存：
 
@@ -256,7 +269,14 @@ staging 证书不适合真实客户端使用。
 - 可选的基于 Vultr `100MB.bin` 的分段下载速度
 - 可选的 HTTP 返回码
 
-## Clash Verge Rev 合并
+## 客户端导入
+
+`Trojan` 和 `AnyTLS` 的导入方式不同：
+
+- `Trojan`：继续使用 `trojan://...`，也可以用下面的 Clash Verge Rev 增强脚本方式合并到现有订阅。
+- `AnyTLS`：订阅地址会直接返回 Mihomo/Clash YAML，可在 Clash Verge Rev 里作为远程配置导入。
+
+### Clash Verge Rev 合并
 
 不要直接编辑订阅下载下来的 YAML；订阅更新时会覆盖。推荐生成增强脚本，把本项目的 Trojan 节点注入到现有订阅的策略组里：
 
@@ -272,6 +292,8 @@ staging 证书不适合真实客户端使用。
 
 在 Clash Verge Rev 里把这个文件作为当前订阅的 Script/脚本增强使用。订阅的 rules 和 proxy-groups 仍然来自原订阅；每次订阅更新后，这个本地节点会重新加回策略组。
 
+这个脚本只适用于 `Trojan` 部署；`AnyTLS` 不生成 Clash Verge 节点增强脚本。
+
 ## 文件结构
 
 ```text
@@ -282,7 +304,9 @@ scripts/lib.sh
 scripts/export-clash-verge-script.sh
 templates/cloud-init.yml
 templates/docker-compose.yml
+templates/docker-compose-anytls.yml
 templates/nginx-default.conf
+templates/nginx-default-tls.conf
 templates/fallback-index.html
 .env.example
 ```
@@ -297,20 +321,32 @@ templates/fallback-index.html
 
 ```text
 docker-compose.yml
-xray/config.json
 certs/fullchain.pem
 certs/privkey.pem
 nginx/default.conf
 nginx/html/index.html
 ```
 
+如果是 `Trojan`：
+
+```text
+xray/config.json
+```
+
+如果是 `AnyTLS`：
+
+```text
+sing-box/config.json
+```
+
 ## 注意
 
 - 建议给 Vultr 配置 Cloud Firewall，只开放 `443/tcp` 和必要的 `22/tcp`。
-- 如果需要普通 Web 外观，也开放 `80/tcp`；nginx 会把 HTTP 301 跳转到 HTTPS。
+- 如果使用 `AnyTLS`，还需要放行 `ANYTLS_PORT`，默认 `8443/tcp`。
+- 如果需要普通 Web 外观，也开放 `80/tcp`；Trojan 模式下 HTTPS 由 Xray fallback 到 nginx，AnyTLS 模式下 HTTPS 由 nginx 直接提供。
 - Cloudflare DNS record 必须是 DNS only，即 `proxied=false`。
 - 订阅地址由 `.env` 里的 `SUBSCRIPTION_PATH` 控制，默认是 `https://<DOMAIN>/shuadhTrojan.123`，不要公开分享。
-- `.state/trojan-state.json` 包含 Trojan 密码，不要上传或分享。
+- `.state/trojan-state.json` 包含代理密码，不要上传或分享。
 - `.certs/` 包含证书私钥，不要上传或分享。
 
 ## 参考
@@ -318,4 +354,6 @@ nginx/html/index.html
 - [Vultr cloud-init user-data](https://docs.vultr.com/how-to-deploy-a-vultr-server-with-cloudinit-userdata)
 - [Cloudflare DNS records API](https://developers.cloudflare.com/dns/manage-dns-records/how-to/create-dns-records/)
 - [Xray Docker image layout](https://xtls.github.io/en/document/install.html#docker-installation)
+- [sing-box AnyTLS inbound](https://sing-box.sagernet.org/configuration/inbound/anytls/)
+- [sing-box remote profile import](https://sing-box.sagernet.org/clients/general/)
 - [Docker Engine for Ubuntu](https://docs.docker.com/engine/install/ubuntu/)

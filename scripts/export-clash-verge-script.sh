@@ -15,9 +15,12 @@ need_cmd jq
 [ -f "$STATE_FILE" ] || die "State file not found: $STATE_FILE"
 
 domain="$(state_get domain)"
+proxy_stack="$(state_get proxy_stack || true)"
 password="$(state_get trojan_password)"
 
+[ -n "$proxy_stack" ] || proxy_stack="trojan"
 [ -n "$domain" ] || die "Missing domain in state"
+[ "$proxy_stack" = "trojan" ] || die "Clash Verge enhancement script is only supported for Trojan deployments"
 [ -n "$password" ] || die "Missing trojan_password in state"
 
 mkdir -p "$(dirname "$OUTPUT_FILE")"
@@ -86,4 +89,3 @@ EOF
 
 chmod 600 "$OUTPUT_FILE"
 printf 'Wrote %s\n' "$OUTPUT_FILE"
-

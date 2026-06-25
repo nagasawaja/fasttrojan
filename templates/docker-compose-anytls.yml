@@ -1,0 +1,23 @@
+services:
+  sing-box:
+    image: ${SING_BOX_IMAGE:-ghcr.io/sagernet/sing-box:latest}
+    container_name: anytls-sing-box
+    restart: unless-stopped
+    command: -D /var/lib/sing-box -C /etc/sing-box/ run
+    ports:
+      - "${ANYTLS_PORT:-8443}:${ANYTLS_PORT:-8443}/tcp"
+    volumes:
+      - ./sing-box/config.json:/etc/sing-box/config.json:ro
+      - ./certs:/etc/sing-box/certs:ro
+
+  nginx:
+    image: nginx:stable-alpine
+    container_name: anytls-fallback
+    restart: unless-stopped
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/html:/usr/share/nginx/html:ro
+      - ./certs:/etc/nginx/certs:ro

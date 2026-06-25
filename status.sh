@@ -50,8 +50,12 @@ require_env DOMAIN
 local_instance_id="$(state_get instance_id || true)"
 local_ip="$(state_get main_ip || true)"
 local_dns_record_id="$(state_get dns_record_id || true)"
+local_proxy_stack="$(state_get proxy_stack || true)"
+local_anytls_port="$(state_get anytls_port || true)"
 local_subscription_path="$(state_get subscription_path || true)"
+[ -n "$local_proxy_stack" ] || local_proxy_stack="${PROXY_STACK:-trojan}"
 [ -n "$local_subscription_path" ] || local_subscription_path="${SUBSCRIPTION_PATH:-/shuadhTrojan.123}"
+[ -n "$local_anytls_port" ] || local_anytls_port="${ANYTLS_PORT:-8443}"
 
 encoded_domain="$(urlencode "$DOMAIN")"
 cf_response="$(cloudflare_api GET "/zones/$CLOUDFLARE_ZONE_ID/dns_records?type=A&name=$encoded_domain&per_page=100")"
@@ -95,6 +99,7 @@ if [ -n "${VULTR_API_KEY:-}" ] && [ -n "$local_instance_id" ]; then
 fi
 
 printf 'Domain:              %s\n' "$DOMAIN"
+printf 'Proxy stack:         %s\n' "${local_proxy_stack:-missing}"
 printf 'Local state IP:      %s\n' "${local_ip:-missing}"
 printf 'Cloudflare A record: %s\n' "${cf_ip:-missing}"
 printf 'Cloudflare record ID: %s\n' "${cf_id:-missing}"
@@ -103,6 +108,9 @@ printf 'Cloudflare proxied:  %s\n' "${cf_proxied:-missing}"
 printf 'System resolver IP:  %s\n' "${resolver_ip:-unavailable}"
 printf '1.1.1.1 resolver IP: %s\n' "${authoritative_ip:-unavailable}"
 printf 'Vultr instance:      %s\n' "$vultr_summary"
+if [ "$local_proxy_stack" = "anytls" ]; then
+  printf 'AnyTLS port:         %s\n' "${local_anytls_port:-missing}"
+fi
 printf 'Subscription path:   %s\n' "${local_subscription_path:-missing}"
 printf 'Subscription URL:    https://%s%s\n' "$DOMAIN" "$local_subscription_path"
 

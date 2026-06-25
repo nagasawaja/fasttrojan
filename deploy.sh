@@ -10,7 +10,7 @@ usage() {
 Usage: ./deploy.sh [--env FILE] [--force-new]
 
 Creates or reuses a Vultr instance, points a Cloudflare DNS A record at it,
-deploys Docker Compose with Xray Trojan, and prints a client URI.
+deploys Docker Compose with the selected proxy stack, and prints a client URI.
 
 Options:
   --env FILE     Load a different env file. Default: ./.env
@@ -69,8 +69,9 @@ VULTR_REGION="${VULTR_REGION:-nrt}"
 VULTR_PLAN="${VULTR_PLAN:-vc2-1c-1gb}"
 VULTR_OS_NAME="${VULTR_OS_NAME:-Ubuntu 24.04 x64}"
 VULTR_OS_QUERY="${VULTR_OS_QUERY:-Ubuntu 24.04}"
+PROXY_STACK="${PROXY_STACK:-trojan}"
 DEFAULT_VULTR_LABEL_TS="$(date '+%Y%m%d%H%M')"
-VULTR_LABEL="${VULTR_LABEL:-trojan-${DOMAIN//./-}-${DEFAULT_VULTR_LABEL_TS}}"
+VULTR_LABEL="${VULTR_LABEL:-${PROXY_STACK}-${DOMAIN//./-}-${DEFAULT_VULTR_LABEL_TS}}"
 VULTR_HOSTNAME="$(printf '%s' "$VULTR_LABEL" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-' | cut -c1-63)"
 VULTR_ENABLE_IPV6="${VULTR_ENABLE_IPV6:-false}"
 VULTR_SSH_PUBLIC_KEY_FILE="${VULTR_SSH_PUBLIC_KEY_FILE:-~/.ssh/id_ed25519.pub}"
@@ -88,19 +89,39 @@ ACME_DNS_PROPAGATION_SECONDS="${ACME_DNS_PROPAGATION_SECONDS:-30}"
 CERT_RENEW_BEFORE_SECONDS="${CERT_RENEW_BEFORE_SECONDS:-2592000}"
 CERTBOT_IMAGE="${CERTBOT_IMAGE:-certbot/dns-cloudflare:latest}"
 XRAY_IMAGE="${XRAY_IMAGE:-ghcr.io/xtls/xray-core:latest}"
+SING_BOX_IMAGE="${SING_BOX_IMAGE:-ghcr.io/sagernet/sing-box:latest}"
 REMOTE_DIR="${REMOTE_DIR:-/opt/trojan}"
 DEPLOY_METHOD="${DEPLOY_METHOD:-cloud-init}"
 SUBSCRIPTION_PATH="${SUBSCRIPTION_PATH:-/shuadhTrojan.123}"
 DESTROY_OLD_ON_FORCE_NEW="${DESTROY_OLD_ON_FORCE_NEW:-true}"
+PROXY_PASSWORD="${PROXY_PASSWORD:-}"
+ANYTLS_PORT="${ANYTLS_PORT:-8443}"
 CERTBOT_CREDENTIALS_FILE=""
 
-[ "$(json_bool "$CF_PROXIED")" = false ] || die "CF_PROXIED must stay false for normal Trojan TCP"
+[ "$(json_bool "$CF_PROXIED")" = false ] || die "CF_PROXIED must stay false for direct proxy traffic"
 case "$DEPLOY_METHOD" in
   cloud-init|ssh) ;;
   *) die "Unsupported DEPLOY_METHOD: $DEPLOY_METHOD" ;;
 esac
+case "$PROXY_STACK" in
+  trojan|anytls) ;;
+  *) die "Unsupported PROXY_STACK: $PROXY_STACK" ;;
+esac
 [ -n "$VULTR_HOSTNAME" ] || die "Resolved empty Vultr hostname from VULTR_LABEL"
 [ "${SUBSCRIPTION_PATH#/}" != "$SUBSCRIPTION_PATH" ] || die "SUBSCRIPTION_PATH must start with /"
+case "$ANYTLS_PORT" in
+  ''|*[!0-9]*) die "ANYTLS_PORT must be a numeric TCP port" ;;
+esac
+if [ "$PROXY_STACK" = "anytls" ] && { [ "$ANYTLS_PORT" -eq 80 ] || [ "$ANYTLS_PORT" -eq 443 ]; }; then
+  die "ANYTLS_PORT must not be 80 or 443; those ports are reserved for the fallback web/subscription endpoint"
+fi
+
+stack_display_name() {
+  case "$PROXY_STACK" in
+    trojan) printf 'Trojan\n' ;;
+    anytls) printf 'AnyTLS\n' ;;
+  esac
+}
 
 preflight_api_access() {
   log "Checking Vultr API access"
@@ -163,7 +184,7 @@ ensure_vultr_ssh_key() {
   if [ ! -f "$SSH_PRIVATE_KEY_FILE" ] && [ "$(json_bool "$GENERATE_SSH_KEY")" = true ]; then
     log "Generating local SSH key: $SSH_PRIVATE_KEY_FILE"
     mkdir -p "$(dirname "$SSH_PRIVATE_KEY_FILE")"
-    ssh-keygen -t ed25519 -N '' -f "$SSH_PRIVATE_KEY_FILE" -C "trojan-deploy-$DOMAIN" >/dev/null
+    ssh-keygen -t ed25519 -N '' -f "$SSH_PRIVATE_KEY_FILE" -C "proxy-deploy-$DOMAIN" >/dev/null
   fi
 
   if [ -f "$SSH_PRIVATE_KEY_FILE" ] && [ ! -f "$VULTR_SSH_PUBLIC_KEY_FILE" ]; then
@@ -185,7 +206,7 @@ ensure_vultr_ssh_key() {
   fi
 
   log "Uploading SSH public key to Vultr"
-  payload="$(jq -n --arg name "trojan-auto-$(date '+%Y%m%d%H%M%S')" --arg key "$public_key" '{name:$name, ssh_key:$key}')"
+  payload="$(jq -n --arg name "proxy-auto-$(date '+%Y%m%d%H%M%S')" --arg key "$public_key" '{name:$name, ssh_key:$key}')"
   created="$(vultr_api POST '/ssh-keys' "$payload")"
   key_id="$(printf '%s' "$created" | jq -r '.ssh_key.id')"
   [ -n "$key_id" ] || die "Vultr did not return an SSH key id"
@@ -208,6 +229,7 @@ create_instance() {
     --arg hostname "$VULTR_HOSTNAME" \
     --arg user_data "$cloud_init_b64" \
     --arg ssh_key_id "$ssh_key_id" \
+    --arg proxy_stack "$PROXY_STACK" \
     --arg firewall_group_id "${VULTR_FIREWALL_GROUP_ID:-}" \
     --argjson enable_ipv6 "$(json_bool "$VULTR_ENABLE_IPV6")" \
     --argjson os_id "$os_id" \
@@ -221,7 +243,7 @@ create_instance() {
       "enable_ipv6": $enable_ipv6,
       "activation_email": false,
       "sshkey_id": [$ssh_key_id],
-      "tags": ["trojan", "ephemeral"]
+      "tags": [$proxy_stack, "ephemeral"]
     } + (if $firewall_group_id != "" then {"firewall_group_id": $firewall_group_id} else {} end)')" || return 1
 
   log "Creating Vultr instance: region=$VULTR_REGION plan=$VULTR_PLAN os=$os_id"
@@ -344,16 +366,25 @@ destroy_old_instance_if_needed() {
   esac
 }
 
-ensure_trojan_password() {
+ensure_proxy_password() {
   local existing
-  if [ -n "${TROJAN_PASSWORD:-}" ]; then
+
+  if [ -n "$PROXY_PASSWORD" ]; then
+    printf '%s\n' "$PROXY_PASSWORD"
+    return
+  fi
+
+  if [ "$PROXY_STACK" = "trojan" ] && [ -n "${TROJAN_PASSWORD:-}" ]; then
     printf '%s\n' "$TROJAN_PASSWORD"
     return
   fi
 
   existing=""
   if [ "$FORCE_NEW" = false ]; then
-    existing="$(state_get trojan_password || true)"
+    existing="$(state_get proxy_password || true)"
+    if [ -z "$existing" ] && [ "$PROXY_STACK" = "trojan" ]; then
+      existing="$(state_get trojan_password || true)"
+    fi
   fi
   if [ -n "$existing" ]; then
     printf '%s\n' "$existing"
@@ -463,13 +494,43 @@ upsert_dns_record() {
   printf '%s\n' "$record_id"
 }
 
+subscription_content_type() {
+  case "$PROXY_STACK" in
+    trojan) printf 'application/x-yaml\n' ;;
+    anytls) printf 'application/x-yaml\n' ;;
+  esac
+}
+
+build_client_uri() {
+  local password="$1"
+  local subscription_url
+
+  case "$PROXY_STACK" in
+    trojan)
+      printf 'trojan://%s@%s:443?security=tls&type=tcp&sni=%s#%s\n' \
+        "$(urlencode "$password")" \
+        "$DOMAIN" \
+        "$(urlencode "$DOMAIN")" \
+        "$(urlencode "$VULTR_LABEL")"
+      ;;
+    anytls)
+      printf 'https://%s%s\n' "$DOMAIN" "$SUBSCRIPTION_PATH"
+      ;;
+  esac
+}
+
 write_state() {
   local instance_id="$1"
   local ip="$2"
   local dns_record_id="$3"
   local password="$4"
   local client_uri="$5"
-  local tmp
+  local tmp trojan_password
+
+  trojan_password=""
+  if [ "$PROXY_STACK" = "trojan" ]; then
+    trojan_password="$password"
+  fi
 
   tmp="$(mktemp)"
   jq -n \
@@ -478,11 +539,14 @@ write_state() {
     --arg main_ip "$ip" \
     --arg region "$VULTR_REGION" \
     --arg plan "$VULTR_PLAN" \
+    --arg proxy_stack "$PROXY_STACK" \
+    --arg proxy_password "$password" \
     --arg dns_record_id "$dns_record_id" \
-    --arg trojan_password "$password" \
+    --arg trojan_password "$trojan_password" \
     --arg client_uri "$client_uri" \
     --arg remote_dir "$REMOTE_DIR" \
     --arg subscription_path "$SUBSCRIPTION_PATH" \
+    --arg anytls_port "$ANYTLS_PORT" \
     --arg updated_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
     '{
       domain: $domain,
@@ -490,11 +554,14 @@ write_state() {
       main_ip: $main_ip,
       region: $region,
       plan: $plan,
+      proxy_stack: $proxy_stack,
+      proxy_password: $proxy_password,
       dns_record_id: $dns_record_id,
       trojan_password: $trojan_password,
       client_uri: $client_uri,
       remote_dir: $remote_dir,
       subscription_path: $subscription_path,
+      anytls_port: ($anytls_port | tonumber),
       updated_at: $updated_at
     }' > "$tmp"
   mv "$tmp" "$STATE_FILE"
@@ -508,71 +575,234 @@ build_bundle() {
   local fullchain="$2"
   local private_key="$3"
   local bundle_dir="$STATE_DIR/build"
+  local subscription_file subscription_dir subscription_type
 
   rm -rf "$bundle_dir"
-  mkdir -p "$bundle_dir/xray" "$bundle_dir/nginx/html" "$bundle_dir/certs"
+  mkdir -p "$bundle_dir/nginx/html" "$bundle_dir/certs"
+  subscription_file="$bundle_dir/nginx/html${SUBSCRIPTION_PATH}"
+  subscription_dir="$(dirname "$subscription_file")"
+  mkdir -p "$subscription_dir"
+  subscription_type="$(subscription_content_type)"
+  case "$PROXY_STACK" in
+    trojan)
+      [ -f "$ROOT_DIR/b.yaml" ] || die "Trojan stack requires $ROOT_DIR/b.yaml for the hosted subscription"
+      mkdir -p "$bundle_dir/xray"
+      cp "$ROOT_DIR/templates/docker-compose.yml" "$bundle_dir/docker-compose.yml"
+      sed \
+        -e "s#__DOMAIN__#${DOMAIN}#g" \
+        -e "s#__SUBSCRIPTION_PATH__#${SUBSCRIPTION_PATH}#g" \
+        -e "s#__SUBSCRIPTION_CONTENT_TYPE__#${subscription_type}#g" \
+        "$ROOT_DIR/templates/nginx-default.conf" > "$bundle_dir/nginx/default.conf"
+      cp "$ROOT_DIR/b.yaml" "$subscription_file"
+      printf 'XRAY_IMAGE=%s\nSING_BOX_IMAGE=%s\nANYTLS_PORT=%s\n' "$XRAY_IMAGE" "$SING_BOX_IMAGE" "$ANYTLS_PORT" > "$bundle_dir/.env"
 
-  cp "$ROOT_DIR/templates/docker-compose.yml" "$bundle_dir/docker-compose.yml"
-  sed \
-    -e "s#__DOMAIN__#${DOMAIN}#g" \
-    -e "s#__SUBSCRIPTION_PATH__#${SUBSCRIPTION_PATH}#g" \
-    "$ROOT_DIR/templates/nginx-default.conf" > "$bundle_dir/nginx/default.conf"
+      jq -n \
+        --arg domain "$DOMAIN" \
+        --arg password "$password" \
+        '{
+          log: {loglevel: "warning"},
+          inbounds: [
+            {
+              tag: "trojan-in",
+              listen: "0.0.0.0",
+              port: 443,
+              protocol: "trojan",
+              settings: {
+                clients: [
+                  {password: $password, email: "default"}
+                ],
+                fallbacks: [
+                  {dest: "nginx:8080"}
+                ]
+              },
+              streamSettings: {
+                network: "tcp",
+                security: "tls",
+                tlsSettings: {
+                  serverName: $domain,
+                  minVersion: "1.2",
+                  alpn: ["http/1.1"],
+                  certificates: [
+                    {
+                      certificateFile: "/usr/local/etc/xray/certs/fullchain.pem",
+                      keyFile: "/usr/local/etc/xray/certs/privkey.pem"
+                    }
+                  ]
+                }
+              }
+            }
+          ],
+          outbounds: [
+            {protocol: "freedom", tag: "direct"},
+            {protocol: "blackhole", tag: "block"}
+          ]
+        }' > "$bundle_dir/xray/config.json"
+      ;;
+    anytls)
+      mkdir -p "$bundle_dir/sing-box"
+      cp "$ROOT_DIR/templates/docker-compose-anytls.yml" "$bundle_dir/docker-compose.yml"
+      sed \
+        -e "s#__DOMAIN__#${DOMAIN}#g" \
+        -e "s#__SUBSCRIPTION_PATH__#${SUBSCRIPTION_PATH}#g" \
+        -e "s#__SUBSCRIPTION_CONTENT_TYPE__#${subscription_type}#g" \
+        "$ROOT_DIR/templates/nginx-default-tls.conf" > "$bundle_dir/nginx/default.conf"
+      printf 'XRAY_IMAGE=%s\nSING_BOX_IMAGE=%s\nANYTLS_PORT=%s\n' "$XRAY_IMAGE" "$SING_BOX_IMAGE" "$ANYTLS_PORT" > "$bundle_dir/.env"
+
+      jq -n \
+        --argjson listen_port "$ANYTLS_PORT" \
+        --arg password "$password" \
+        '{
+          log: { level: "warn" },
+          inbounds: [
+            {
+              type: "anytls",
+              tag: "anytls-in",
+              listen: "0.0.0.0",
+              listen_port: $listen_port,
+              users: [
+                {
+                  name: "default",
+                  password: $password
+                }
+              ],
+              tls: {
+                enabled: true,
+                min_version: "1.2",
+                certificate_path: "/etc/sing-box/certs/fullchain.pem",
+                key_path: "/etc/sing-box/certs/privkey.pem"
+              }
+            }
+          ],
+          outbounds: [
+            { type: "direct", tag: "direct" }
+          ]
+        }' > "$bundle_dir/sing-box/config.json"
+
+      cat > "$subscription_file" <<EOF
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+external-controller: 127.0.0.1:9090
+ipv6: false
+unified-delay: true
+
+profile:
+  store-selected: true
+  store-fake-ip: true
+
+dns:
+  enable: true
+  listen: 127.0.0.1:1053
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/15
+  nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+    - 1.1.1.1
+    - 8.8.8.8
+  fallback:
+    - tls://1.1.1.1:853
+    - tls://8.8.8.8:853
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+  fake-ip-filter:
+    - "*.lan"
+    - "*.local"
+    - "*.localhost"
+    - "*.localdomain"
+    - "*.home.arpa"
+    - time.*.com
+    - ntp.*.com
+    - "*.ntp.org.cn"
+    - +.pool.ntp.org
+
+proxies:
+  - name: anytls-$DOMAIN
+    type: anytls
+    server: $DOMAIN
+    port: $ANYTLS_PORT
+    password: "$password"
+    client-fingerprint: chrome
+    udp: true
+    idle-session-check-interval: 30
+    idle-session-timeout: 30
+    min-idle-session: 0
+    sni: "$DOMAIN"
+    alpn:
+      - h2
+      - http/1.1
+    skip-cert-verify: false
+
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - anytls-$DOMAIN
+
+  - name: FINAL
+    type: select
+    proxies:
+      - PROXY
+      - DIRECT
+
+rules:
+  - GEOSITE,cn,DIRECT
+  - DOMAIN-SUFFIX,cn,DIRECT
+  - DOMAIN-SUFFIX,中国,DIRECT
+  - DOMAIN-SUFFIX,公司,DIRECT
+  - DOMAIN-SUFFIX,网络,DIRECT
+
+  - DOMAIN-SUFFIX,baidu.com,DIRECT
+  - DOMAIN-SUFFIX,bdstatic.com,DIRECT
+  - DOMAIN-SUFFIX,qq.com,DIRECT
+  - DOMAIN-SUFFIX,weixin.qq.com,DIRECT
+  - DOMAIN-SUFFIX,gtimg.com,DIRECT
+  - DOMAIN-SUFFIX,alicdn.com,DIRECT
+  - DOMAIN-SUFFIX,aliyun.com,DIRECT
+  - DOMAIN-SUFFIX,taobao.com,DIRECT
+  - DOMAIN-SUFFIX,tmall.com,DIRECT
+  - DOMAIN-SUFFIX,jd.com,DIRECT
+  - DOMAIN-SUFFIX,mi.com,DIRECT
+  - DOMAIN-SUFFIX,bilibili.com,DIRECT
+  - DOMAIN-SUFFIX,bilivideo.com,DIRECT
+  - DOMAIN-SUFFIX,douyin.com,DIRECT
+  - DOMAIN-SUFFIX,amemv.com,DIRECT
+  - DOMAIN-SUFFIX,bytedance.com,DIRECT
+  - DOMAIN-SUFFIX,byteimg.com,DIRECT
+  - DOMAIN-SUFFIX,163.com,DIRECT
+  - DOMAIN-SUFFIX,126.net,DIRECT
+  - DOMAIN-SUFFIX,sina.com.cn,DIRECT
+  - DOMAIN-SUFFIX,weibo.com,DIRECT
+  - DOMAIN-SUFFIX,zhihu.com,DIRECT
+  - DOMAIN-SUFFIX,xiaohongshu.com,DIRECT
+  - DOMAIN-SUFFIX,meituan.com,DIRECT
+  - DOMAIN-SUFFIX,dianping.com,DIRECT
+  - DOMAIN-SUFFIX,autonavi.com,DIRECT
+  - DOMAIN-SUFFIX,amap.com,DIRECT
+  - DOMAIN-SUFFIX,12306.cn,DIRECT
+  - DOMAIN-SUFFIX,gov.cn,DIRECT
+
+  - GEOIP,CN,DIRECT
+  - MATCH,PROXY
+EOF
+      ;;
+  esac
+
   cp "$ROOT_DIR/templates/fallback-index.html" "$bundle_dir/nginx/html/index.html"
-  cp "$ROOT_DIR/b.yaml" "$bundle_dir/nginx/html${SUBSCRIPTION_PATH}"
   cp "$fullchain" "$bundle_dir/certs/fullchain.pem"
   cp "$private_key" "$bundle_dir/certs/privkey.pem"
-  chmod 644 "$bundle_dir/nginx/html/index.html" "$bundle_dir/nginx/html${SUBSCRIPTION_PATH}"
+  chmod 644 "$bundle_dir/nginx/html/index.html" "$subscription_file"
   chmod 644 "$bundle_dir/certs/fullchain.pem" "$bundle_dir/certs/privkey.pem"
-  printf 'XRAY_IMAGE=%s\n' "$XRAY_IMAGE" > "$bundle_dir/.env"
-
-  jq -n \
-    --arg domain "$DOMAIN" \
-    --arg password "$password" \
-    '{
-      log: {loglevel: "warning"},
-      inbounds: [
-        {
-          tag: "trojan-in",
-          listen: "0.0.0.0",
-          port: 443,
-          protocol: "trojan",
-          settings: {
-            clients: [
-              {password: $password, email: "default"}
-            ],
-            fallbacks: [
-              {dest: "nginx:8080"}
-            ]
-          },
-          streamSettings: {
-            network: "tcp",
-            security: "tls",
-            tlsSettings: {
-              serverName: $domain,
-              minVersion: "1.2",
-              alpn: ["http/1.1"],
-              certificates: [
-                {
-                  certificateFile: "/usr/local/etc/xray/certs/fullchain.pem",
-                  keyFile: "/usr/local/etc/xray/certs/privkey.pem"
-                }
-              ]
-            }
-          }
-        }
-      ],
-      outbounds: [
-        {protocol: "freedom", tag: "direct"},
-        {protocol: "blackhole", tag: "block"}
-      ]
-    }' > "$bundle_dir/xray/config.json"
 
   printf '%s\n' "$bundle_dir"
 }
 
 build_cloud_init_file() {
   local bundle_dir="$1"
-  local archive="$STATE_DIR/trojan-bundle.tar.gz"
+  local archive="$STATE_DIR/proxy-bundle.tar.gz"
   local cloud_init_file="$STATE_DIR/cloud-init-rendered.yml"
   local archive_b64
 
@@ -587,7 +817,7 @@ build_cloud_init_file() {
     printf '  - ca-certificates\n'
     printf '  - curl\n'
     printf 'write_files:\n'
-    printf '  - path: /root/trojan-bundle.tar.gz\n'
+    printf '  - path: /root/proxy-bundle.tar.gz\n'
     printf '    owner: root:root\n'
     printf "    permissions: '0600'\n"
     printf '    encoding: b64\n'
@@ -601,9 +831,9 @@ build_cloud_init_file() {
     printf '  - apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n'
     printf '  - systemctl enable --now docker\n'
     printf '  - mkdir -p %s\n' "$REMOTE_DIR"
-    printf '  - tar -xzf /root/trojan-bundle.tar.gz -C %s\n' "$REMOTE_DIR"
+    printf '  - tar -xzf /root/proxy-bundle.tar.gz -C %s\n' "$REMOTE_DIR"
     printf '  - cd %s && docker compose pull && docker compose up -d --remove-orphans\n' "$REMOTE_DIR"
-    printf '  - rm -f /root/trojan-bundle.tar.gz\n'
+    printf '  - rm -f /root/proxy-bundle.tar.gz\n'
     printf '  - date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ > %s/.cloud-init-deployed\n' "$REMOTE_DIR"
   } > "$cloud_init_file"
 
@@ -645,7 +875,7 @@ deploy_remote_bundle() {
   ssh_remote "$ip" "mkdir -p '$REMOTE_DIR'"
   scp "${args[@]}" -r "$bundle_dir"/. "$SSH_USER@$ip:$REMOTE_DIR/"
 
-  log "Starting Xray Trojan service"
+  log "Starting $(stack_display_name) service"
   ssh_remote "$ip" "cd '$REMOTE_DIR' && docker compose pull && docker compose up -d --remove-orphans && docker compose ps"
 }
 
@@ -666,12 +896,38 @@ wait_for_https() {
   die "Timed out waiting for HTTPS fallback on $DOMAIN ($ip)"
 }
 
+wait_for_anytls_tls() {
+  local ip="$1"
+  local deadline
+  deadline=$(( $(date +%s) + DEPLOY_WAIT_SECONDS ))
+
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if openssl s_client -connect "$ip:$ANYTLS_PORT" -servername "$DOMAIN" </dev/null >/dev/null 2>&1; then
+      log "AnyTLS TLS listener is ready on $DOMAIN:$ANYTLS_PORT ($ip)"
+      return
+    fi
+    log "Waiting for AnyTLS TLS listener on $DOMAIN:$ANYTLS_PORT ($ip)"
+    sleep 10
+  done
+
+  die "Timed out waiting for AnyTLS TLS listener on $DOMAIN:$ANYTLS_PORT ($ip)"
+}
+
+wait_for_stack_readiness() {
+  local ip="$1"
+
+  wait_for_https "$ip"
+  if [ "$PROXY_STACK" = "anytls" ]; then
+    wait_for_anytls_tls "$ip"
+  fi
+}
+
 main() {
   local old_instance_id password cert_info fullchain private_key instance_info instance_id ip instance_reused dns_record_id client_uri bundle_dir cloud_init_file
 
   preflight_api_access
   old_instance_id="$(state_get instance_id || true)"
-  password="$(ensure_trojan_password)"
+  password="$(ensure_proxy_password)"
   cert_info="$(ensure_certificate)"
   fullchain="$(printf '%s\n' "$cert_info" | sed -n '1p')"
   private_key="$(printf '%s\n' "$cert_info" | sed -n '2p')"
@@ -692,21 +948,26 @@ main() {
     if [ "$instance_reused" = true ]; then
       log "Reused cloud-init instance; local bundle changes are not applied. Use ./deploy.sh --force-new to rebuild the server."
     fi
-    wait_for_https "$ip"
+    wait_for_stack_readiness "$ip"
   else
     deploy_remote_bundle "$ip" "$bundle_dir"
+    wait_for_stack_readiness "$ip"
   fi
 
   dns_record_id="$(upsert_dns_record "$ip")"
 
-  client_uri="trojan://$(urlencode "$password")@$DOMAIN:443?security=tls&type=tcp&sni=$(urlencode "$DOMAIN")#$(urlencode "$VULTR_LABEL")"
+  client_uri="$(build_client_uri "$password")"
   write_state "$instance_id" "$ip" "$dns_record_id" "$password" "$client_uri"
   destroy_old_instance_if_needed "$old_instance_id" "$instance_id"
 
   printf '\nDeployment complete.\n'
+  printf 'Proxy stack: %s\n' "$(stack_display_name)"
   printf 'Domain: %s\n' "$DOMAIN"
   printf 'IP: %s\n' "$ip"
   printf 'Subscription URL: https://%s%s\n' "$DOMAIN" "$SUBSCRIPTION_PATH"
+  if [ "$PROXY_STACK" = "anytls" ]; then
+    printf 'AnyTLS port: %s\n' "$ANYTLS_PORT"
+  fi
   printf 'State: %s\n' "$STATE_FILE"
   printf 'Client URI:\n%s\n' "$client_uri"
 }
